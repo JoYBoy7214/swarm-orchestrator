@@ -23,7 +23,7 @@ func main() {
 		log.Fatal("error in connecting nats", err)
 	}
 	js, err := jetstream.New(nc)
-	s, err := js.Stream(ctx, "task")
+	s, err := js.Stream(ctx, "myswarm")
 	if err != nil {
 		log.Fatal("error in finding the task stream", err)
 	}
