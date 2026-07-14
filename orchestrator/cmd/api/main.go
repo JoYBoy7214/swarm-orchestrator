@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	sub "github.com/JoYBoy7214/swarm-orchestrator/cmd/sub"
 	pub "github.com/JoYBoy7214/swarm-orchestrator/internal/pub"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
@@ -50,7 +51,7 @@ func (ns *NServer) TaskHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err = ns.Jstream.Publish(b, ctx)
+	err = ns.Jstream.Publish(b, ctx, "task.test")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -87,7 +88,7 @@ func main() {
 		log.Fatal("error in creating JetStream", err)
 		return
 	}
-
+	go sub.StatusListenerSub(server.Jstream.Jstream, "test.completed")
 	http.HandleFunc("POST /api/v1/tasks", server.TaskHandler)
 
 	log.Println("Server is Started at 8080")

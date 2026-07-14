@@ -23,7 +23,17 @@ services:
       - qdrant_DB.env
     networks:             
       - ai_pipeline
-
+  python-worker:
+    build:
+      context: ../orchestrator/internal/sub/
+      dockerfile: Dockerfile.sub
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+    depends_on:
+      - qdrant
+    networks:
+      - ai_pipeline
 volumes:
   qdrant_db:             
 

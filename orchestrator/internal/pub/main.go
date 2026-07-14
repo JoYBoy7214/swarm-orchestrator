@@ -36,8 +36,8 @@ func CreateStream() (*Publisher, *nats.Conn, error) {
 	}, nc, err
 }
 
-func (p *Publisher) Publish(message []byte, ctx context.Context) error {
-	pAck, err := p.Jstream.Publish(ctx, "task.test", message)
+func (p *Publisher) Publish(message []byte, ctx context.Context, subject string) error {
+	pAck, err := p.Jstream.Publish(ctx, subject, message)
 	if err != nil {
 		log.Println("error in pusblishing message ", err)
 		return err
