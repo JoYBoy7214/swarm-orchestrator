@@ -12,30 +12,17 @@ services:
     networks:             
       - ai_pipeline
 
-  qdrant:
-    image: qdrant/qdrant:latest 
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_db:/qdrant/storage
+  postgresDB:
+    image: postgres:15-alpine
     env_file:
-      - qdrant_DB.env
-    networks:             
-      - ai_pipeline
-  python-worker:
-    build:
-      context: ../orchestrator/internal/sub/
-      dockerfile: Dockerfile.sub
-    environment:
-      - QDRANT_HOST=qdrant
-      - QDRANT_PORT=6333
-    depends_on:
-      - qdrant
-    networks:
-      - ai_pipeline
+      - postgres_DB.env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_Db:/var/lib/postgresql/data
+    
 volumes:
-  qdrant_db:             
+  postgres_Db:             
 
 networks:                
   ai_pipeline:

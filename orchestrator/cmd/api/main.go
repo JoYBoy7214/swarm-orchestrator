@@ -31,7 +31,7 @@ type Response struct {
 }
 
 type NServer struct {
-	Jstream *pub.Publisher
+	Jstream *pub.JetStreamHandler
 }
 
 func (ns *NServer) TaskHandler(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +51,8 @@ func (ns *NServer) TaskHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err = ns.Jstream.Publish(b, ctx, "task.test")
+	subject_string := "task." + req.TaskType
+	err = ns.Jstream.Publish(b, ctx, subject_string)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -88,7 +89,7 @@ func main() {
 		log.Fatal("error in creating JetStream", err)
 		return
 	}
-	go sub.StatusListenerSub(server.Jstream.Jstream, "test.completed")
+	go sub.StatusListenerSub(server.Jstream.Jstream, "task.status.>")
 	http.HandleFunc("POST /api/v1/tasks", server.TaskHandler)
 
 	log.Println("Server is Started at 8080")

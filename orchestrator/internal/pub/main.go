@@ -1,42 +1,51 @@
-package pub
+package jet_stream
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-type Publisher struct {
+type JetStreamHandler struct {
 	Jstream jetstream.JetStream
+	nats    *nats.Conn
 }
 
-func CreateStream() (*Publisher, *nats.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	nc, err := nats.Connect(nats.DefaultURL)
+func CreateJetStreamHandler(natsUrl string) (*JetStreamHandler, error) {
+	//ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	//defer cancel()
+	nc, err := nats.Connect(natsUrl) //nats.DefaultURL
 	if err != nil {
 		log.Println("error in connecting nats", err)
-		return nil, nil, err
+		return nil, err
 	}
 	js, err := jetstream.New(nc)
 	if err != nil {
 		log.Println("error in creating a jetStream ", err)
-		return nil, nil, err
+		return nil, err
 	}
-	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:     "myswarm",
-		Subjects: []string{"task.>"},
-	})
 	log.Println("Js server started")
-	return &Publisher{
+	return &JetStreamHandler{
 		Jstream: js,
-	}, nc, err
+		nats:    nc,
+	}, err
 }
 
-func (p *Publisher) Publish(message []byte, ctx context.Context, subject string) error {
+func CreateStream(ctx context.Context, streamName string, subject string) error {
+	_, err := p.Jstream.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	if err != nil {
+		return fmt.Errorf("Error in creating stream %s, Error :%w", streamName, err)
+	}
+	return err
+}
+
+func (p *JetStreamHandler) Publish(message []byte, ctx context.Context, subject string) error {
 	pAck, err := p.Jstream.Publish(ctx, subject, message)
 	if err != nil {
 		log.Println("error in pusblishing message ", err)

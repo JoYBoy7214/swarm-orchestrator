@@ -13,9 +13,9 @@ from db_store import QdrantStore
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-async def worker_1(js, stop_event, store):
+async def worker_1(js, stop_event, store,subject_string):
     try:
-        sub = await js.pull_subscribe("task.>", "py_scraper_worker", stream="myswarm")
+        sub = await js.pull_subscribe(subject_string, "py_scraper_worker", stream="myswarm")
        
     except Exception as e:
         print(f"Error creating consumer: {e}")
@@ -59,7 +59,7 @@ async def worker_1(js, stop_event, store):
                     await store.upsert_points("test", my_data)
                     await asyncio.sleep(3)
                     print(f"Processed message: {d}")
-                    await msg.ack()
+                    
                 except Exception as e:
                     logger.error(f"Database processing failed for message {msg.sequence}: {e}")
                     try:
@@ -70,12 +70,17 @@ async def worker_1(js, stop_event, store):
                 try:
                     pub_payload = {"event_id": msg_id, "status": "completed"}
                     json_payload = json.dumps(pub_payload).encode("utf-8")
-                    await js.publish("test.completed", json_payload)
+                    await js.publish("task.status.completed", json_payload)
+                    await msg.ack()
                 except Exception as pub_err:
+                    await msg.nak()
                     print(f"Task saved, but failed to publish completion: {pub_err}")
                 
         except TimeoutError:
             continue  # No messages, loop again and check stop_event
+        except asyncio.CancelledError: #ctrl will trigger t1.cancel by event loop or main thread 
+            # Handle task cancellation smoothly on shutdown
+            break
         except Exception as e:
             if not stop_event.is_set():
                 print(f"Worker 1 error: {e}")
@@ -110,7 +115,7 @@ async def main():
             pass 
 
     # 4. Start Consuming
-    t1 = asyncio.create_task(worker_1(js, stop_event, store)) #This will schelude the coroutine not run it 
+   # t1 = asyncio.create_task(worker_1(js, stop_event, store,"task.scrape.pdf")) #This will schelude the coroutine not run it 
    
     try:
         while not stop_event.is_set():
@@ -119,13 +124,14 @@ async def main():
         stop_event.set()
 
     # 5. Graceful Shutdown
-    try:
-        await t1
-    except asyncio.CancelledError:
-        # This is expected behavior when calling task.cancel()
-        pass
-    except Exception as e:
-        print(f"Worker exited with error during shutdown: {e}")
+    # try:
+    #     await t1
+    # except asyncio.CancelledError:
+    #     # This is expected behavior when calling task.cancel()
+    #     pass
+    # except Exception as e:
+    #     print(f"Worker exited with error during shutdown: {e}")
+    
 
     await nc.close()
 

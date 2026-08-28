@@ -1,0 +1,235 @@
+package postgresDb
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	Graph "github.com/JoYBoy7214/swarm-orchestrator/internal"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type PostgresDriver struct {
+	pool *pgxpool.Pool
+}
+
+func CreatePostgresDriver(ctx context.Context, dbstring string) (*PostgresDriver, error) {
+	pool, err := pgxpool.New(ctx, dbstring)
+	if err != nil {
+		return nil, fmt.Errorf("Error in creating a pgx pool %w", err)
+	}
+	pd := &PostgresDriver{
+		pool: pool,
+	}
+	err = pd.CreateDbs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pd, nil
+}
+
+func (pd *PostgresDriver) CreateDbs(ctx context.Context) error {
+	_, err := pd.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS workflow (
+    workflow_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status      VARCHAR(20) DEFAULT 'PENDING' NOT NULL,
+    updated_at  TIMESTAMP,
+    input_data  JSONb ,
+    output_data JSONb
+ 	);`)
+	if err != nil {
+		return fmt.Errorf("Error in creating workflow table %w", err)
+	}
+
+	_, err = pd.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS tasks (
+    workflow_id UUID NOT NULL,
+    task_id     UUID PRIMARY KEY,
+    task_type   VARCHAR(100),
+    status      VARCHAR(20) DEFAULT 'PENDING' NOT NULL,
+    updated_at  TIMESTAMP,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    input_data  JSONb,
+    output_data JSONb,
+
+    CONSTRAINT fk_workflow FOREIGN KEY (workflow_id) REFERENCES workflow(workflow_id) ON DELETE CASCADE  
+    );`)
+	if err != nil {
+		return fmt.Errorf("Error in creating tasks table %w", err)
+	}
+
+	_, err = pd.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS edges(
+    parent_id  UUID NOT NULL,
+    child_id   UUID NOT NULL,
+
+    PRIMARY kEY (parent_id,child_id),
+    CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES tasks(task_id) on DELETE CASCADE,
+    CONSTRAINT fk_child FOREIGN KEY (child_id) REFERENCES tasks(task_id) on DELETE CASCADE
+    );`)
+	if err != nil {
+		return fmt.Errorf("Error in creating edges table %w", err)
+	}
+	_, err = pd.pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_edges_child_id on edges(child_id);`) //postgres creates index on only one primary key auto matically so we have to manually index it
+	if err != nil {
+		return fmt.Errorf("Error in creating index on child_id on edges table %w", err)
+	}
+	_, err = pd.pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS compound_idx_task_status_workflow_id on tasks(status,workflow_id);`) //creating index on status and workflow_id so DAG evaluate can be optimized
+	if err != nil {
+		return fmt.Errorf("Error in creating index on (status,workflow_id) on tasks table %w", err)
+	}
+
+	return err
+}
+
+func (pd *PostgresDriver) CreateWorkflow(ctx context.Context) (uuid.UUID, error) {
+	DAG := Graph.CreateGraph()
+	workflow_id := uuid.New()
+	current_time := time.Now().UTC()
+	tx, err := pd.pool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("Error in creating Transaction connection %w", err)
+	}
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, `INSERT INTO workflow (workflow_id,created_at,status,updated_at) VALUES ($1,DEFAULT,'PENDING',$2)`, workflow_id, current_time)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("Error in inserting into workflow %w", err)
+	}
+	Q_string_task_insert := `INSERT INTO tasks (workflow_id,task_id,task_type,status,updated_at,created_at)
+							VALUES($1,$2,$3,'PENDING',$4,DEFAULT)`
+	for key := range DAG.Nodes {
+		task_id := uuid.New()
+		_, err = tx.Exec(ctx, Q_string_task_insert, workflow_id, task_id, key, current_time)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("Error in inserting into task table task failed is %s, Error: %w", key, err)
+		}
+		DAG.Nodes[key] = &Graph.Node{ //could cause a problem need to look into it
+			Name: key,
+			ID:   task_id,
+		}
+	}
+	DAG.HardCodeIt()
+	Q_string_edge_insert := `INSERT INTO edges(parent_id,child_id) Values ($1,$2)`
+	for key, val := range DAG.Edges {
+		for _, id := range val {
+			_, err = tx.Exec(ctx, Q_string_edge_insert, key, id)
+			if err != nil {
+				return uuid.Nil, fmt.Errorf("Error in inserting edge in edges table %w", err)
+			}
+		}
+
+	}
+	err = tx.Commit(ctx)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("error in commiting transactions %w", err)
+	}
+	return workflow_id, nil
+}
+func (pd *PostgresDriver) Evaluate(ctx context.Context, workflow_id uuid.UUID) ([]uuid.UUID, error) {
+	cur_time := time.Now().UTC() //could cause in consistency
+	tx, err := pd.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("Error in creating Transaction connection %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	//for every pending task with workflow_id= workflow_id(of tasks table) we will check every row in edges which has child_id=task_id(in the task table)
+	//and check if it parent_status(note: we have mode join on subquery which give edge table about the info of parent status)
+	//we switched from count to subquery since not exists works better than count when we don't need the exact count
+	evaluate_and_update_string := `
+	UPDATE tasks
+	SET status = 'READY',updated_at=$2
+	WHERE status = 'PENDING' and workflow_id =$1
+    AND NOT EXISTS ( 
+		SELECT 1
+		FROM edges e
+		LEFT JOIN tasks p ON e.parent_id = p.task_id
+		WHERE e.child_id = tasks.task_id
+		AND (p.status IS NULL OR p.status != 'COMPLETED')
+    )RETURNING tasks.task_id`
+	rows, err := tx.Query(ctx, evaluate_and_update_string, workflow_id, cur_time)
+	if err != nil {
+		return nil, fmt.Errorf("error in  evaluating DAG %w", err)
+	}
+	defer rows.Close()
+	var ready_list []uuid.UUID
+	for rows.Next() {
+		var temp uuid.UUID
+		if err := rows.Scan(&temp); err != nil {
+			return nil, fmt.Errorf("Error in scanning the rows %w", err)
+		}
+		ready_list = append(ready_list, temp)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("Error in iterating the rows %w", err)
+	}
+	err = tx.Commit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error in commiting transactions while evaluating DAG %w", err)
+	}
+	return ready_list, nil
+}
+
+// func (pd *PostgresDriver) GetworkflowReadyTasks(ctx context.Context, workflow_id uuid.UUID) (error, []uuid.UUID) {
+// 	query_string := `
+// 	select task_id from tasks where workflow_id=$1 and status='READY'
+// 	`
+// 	rows, err := pd.pool.Query(ctx, query_string, workflow_id)
+// 	if err != nil {
+// 		return fmt.Errorf("Error in executing command to get ready task %w", err), nil
+// 	}
+// 	defer rows.Close()
+// 	var ready_list []uuid.UUID
+// 	for rows.Next() {
+// 		var temp uuid.UUID
+// 		if err := rows.Scan(&temp); err != nil {
+// 			return fmt.Errorf("Error in scanning the rows %w", err), nil
+// 		}
+// 		ready_list = append(ready_list, temp)
+// 	}
+// 	if rows.Err() != nil {
+// 		return fmt.Errorf("Error in iterating the rows %w", err), nil
+// 	}
+
+// 	return nil, ready_list
+// }
+
+func (pd *PostgresDriver) UpdateTask(ctx context.Context, task_id uuid.UUID, workflow_id uuid.UUID, status string) error {
+	query_string := `
+	update tasks
+	set status =$1
+	where workflow_id=$2 AND task_id=$3
+	`
+	_, err := pd.pool.Exec(ctx, query_string, status, workflow_id, task_id)
+	if err != nil {
+		return fmt.Errorf("Error in updating the task status %w", err)
+	}
+	return nil
+}
+
+type Temp struct {
+	Task_id     uuid.UUID
+	Task_type   string
+	Task_status string
+}
+
+func (pd *PostgresDriver) TesttempGettingInfo(ctx context.Context, workflow_id uuid.UUID) ([]Temp, error) {
+	var result []Temp
+	query_string := "select task_id,task_type,status from tasks where workflow_id =$1"
+	rows, err := pd.pool.Query(ctx, query_string, workflow_id)
+	if err != nil {
+		return nil, fmt.Errorf("Error in executing command to get ready task %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var temp1 Temp
+		if err := rows.Scan(&temp1.Task_id, &temp1.Task_type, &temp1.Task_status); err != nil {
+			return nil, fmt.Errorf("Error in scanning the rows %w", err)
+		}
+		result = append(result, temp1)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("Error in iterating the rows %w", err)
+	}
+	return result, nil
+}
