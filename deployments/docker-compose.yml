@@ -20,6 +20,13 @@ services:
       - "5432:5432"
     volumes:
       - postgres_Db:/var/lib/postgresql/data
+
+  worker:
+    build:
+      context: ../orchestrator/internal/sub
+      dockerfile: Dockerfile.sub
+    networks:
+      - ai_pipeline 
     
 volumes:
   postgres_Db:             

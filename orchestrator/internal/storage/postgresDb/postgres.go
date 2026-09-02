@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	Graph "github.com/JoYBoy7214/swarm-orchestrator/internal"
+	storage "github.com/JoYBoy7214/swarm-orchestrator/internal/storage"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,14 +24,14 @@ func CreatePostgresDriver(ctx context.Context, dbstring string) (*PostgresDriver
 	pd := &PostgresDriver{
 		pool: pool,
 	}
-	err = pd.CreateDbs(ctx)
+	err = pd.createDbs(ctx)
 	if err != nil {
 		return nil, err
 	}
 	return pd, nil
 }
 
-func (pd *PostgresDriver) CreateDbs(ctx context.Context) error {
+func (pd *PostgresDriver) createDbs(ctx context.Context) error {
 	_, err := pd.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS workflow (
     workflow_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -91,10 +92,12 @@ func (pd *PostgresDriver) CreateWorkflow(ctx context.Context) (uuid.UUID, error)
 		return uuid.Nil, fmt.Errorf("Error in creating Transaction connection %w", err)
 	}
 	defer tx.Rollback(ctx)
+
 	_, err = tx.Exec(ctx, `INSERT INTO workflow (workflow_id,created_at,status,updated_at) VALUES ($1,DEFAULT,'PENDING',$2)`, workflow_id, current_time)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("Error in inserting into workflow %w", err)
 	}
+
 	Q_string_task_insert := `INSERT INTO tasks (workflow_id,task_id,task_type,status,updated_at,created_at)
 							VALUES($1,$2,$3,'PENDING',$4,DEFAULT)`
 	for key := range DAG.Nodes {
@@ -108,6 +111,7 @@ func (pd *PostgresDriver) CreateWorkflow(ctx context.Context) (uuid.UUID, error)
 			ID:   task_id,
 		}
 	}
+
 	DAG.HardCodeIt()
 	Q_string_edge_insert := `INSERT INTO edges(parent_id,child_id) Values ($1,$2)`
 	for key, val := range DAG.Edges {
@@ -123,6 +127,7 @@ func (pd *PostgresDriver) CreateWorkflow(ctx context.Context) (uuid.UUID, error)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("error in commiting transactions %w", err)
 	}
+
 	return workflow_id, nil
 }
 func (pd *PostgresDriver) Evaluate(ctx context.Context, workflow_id uuid.UUID) ([]uuid.UUID, error) {
@@ -211,6 +216,29 @@ type Temp struct {
 	Task_id     uuid.UUID
 	Task_type   string
 	Task_status string
+}
+
+func (pd *PostgresDriver) GetAllReadyLongLivedTasks(ctx context.Context) ([]storage.Tempschema, error) {
+	var result []storage.Tempschema
+
+	query_string := `select workflow_id,Task_id,Task_type from tasks where status='READY' and (updated_at - created_at) > INTERVAL '1 minute' `
+	rows, err := pd.pool.Query(ctx, query_string)
+	if err != nil {
+		return nil, fmt.Errorf("Error in getting the lofn lived ready rows  %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var temp storage.Tempschema
+		if err = rows.Scan(&temp); err != nil {
+			return nil, fmt.Errorf("Error in iterating the rows %w", err)
+		}
+		result = append(result, temp)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("Error in iterating the rows %w", err)
+	}
+
+	return result, nil
 }
 
 func (pd *PostgresDriver) TesttempGettingInfo(ctx context.Context, workflow_id uuid.UUID) ([]Temp, error) {

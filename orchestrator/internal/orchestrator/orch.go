@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
+	"sync"
 	"time"
 
 	"github.com/JoYBoy7214/swarm-orchestrator/internal/jet_stream"
@@ -43,11 +41,8 @@ func CreateOrchestrator(ctx context.Context, DbString string, natsUrl string) (*
 	}, nil
 }
 
-func (orch *Orchestrator) StartOrchestrating() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	InterruptCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+func (orch *Orchestrator) StartOrchestrating(ctx context.Context) {
+	var wg sync.WaitGroup
 	consumer, err := orch.StreamHandler.Jstream.CreateOrUpdateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
 		Durable:       "ORCH_CONS",
 		FilterSubject: "task.COMPLETED",
@@ -56,66 +51,92 @@ func (orch *Orchestrator) StartOrchestrating() {
 	if err != nil {
 		log.Fatal("Error in creating consumers")
 	}
-	go orch.pullConsumer(ctx, consumer)
-	<-InterruptCtx.Done()
-	cancel()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		orch.pullConsumer(ctx, consumer)
+	}()
+	<-ctx.Done()
+	wg.Wait()
 
 }
 func (orch *Orchestrator) pullConsumer(ctx context.Context, consumer jetstream.Consumer) {
 	//we will evalute the DAG in batch so we can reduce the DB Calls why this works(according to me) let say we have
 	// a graph of 500 nodes evaluating every time a task completed will inefficient and number of the ready task also will be less
 	//so evaluting after 100 task completed or 1 sec could lead to more ready tasks
+	var wg sync.WaitGroup
 	for {
-		bulk, err := consumer.Fetch(100, jetstream.FetchMaxWait(1*time.Second))
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) { // in case the queue is not full by one second
-				log.Println("Deadline reached before filling the queue %w", err)
-			} else {
-				log.Fatal("Error in fetching message from stream %w", err)
-				return
+		select {
+		case <-ctx.Done():
+			log.Println("waiting for goroutines to end")
+			wg.Wait()
+			log.Println("goroutines ended")
+			return
+		default:
+			//fmt.Println("I am running 1")
+			bulk, err := consumer.Fetch(100, jetstream.FetchMaxWait(1*time.Second))
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) { // in case the queue is not full by one second
+					log.Println("Deadline reached before filling the queue %w", err)
+				} else {
+					log.Fatal("Error in fetching message from stream %w", err)
+					return
+				}
 			}
+			for m := range bulk.Messages() {
+
+				wg.Add(1)
+				go func(m jetstream.Msg) {
+					//don't tie root context to goroutines since if the root context dies the all child ctx also dies
+					//so here DB calls and publisher will throw context canceled error even we provide time to shutdown gracfully
+					processContext, processcontextCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					defer processcontextCancel()
+					defer wg.Done()
+					var msg tempschema
+					err := json.Unmarshal(m.Data(), &msg)
+					if err != nil {
+						log.Println("Error in converting jetstream.Msg to tempschema %w", err)
+						return
+					}
+					workflow_id := msg.WorkFlow_id //can be further optimized by evaluating one workflow only one time
+					task_id := msg.Task_id
+					err = orch.DbDriver.UpdateTask(processContext, task_id, workflow_id, "COMPLETED")
+					if err != nil {
+						log.Println("Error in updating task_status %w:", err)
+						return
+					}
+
+					ready_task, err := orch.DbDriver.Evaluate(processContext, workflow_id)
+					if err != nil {
+						log.Println("Error in Evaluating DAG %w", err)
+						return
+					}
+
+					err = orch.testTempLogger(processContext, workflow_id)
+					if err != nil {
+						log.Println("Error in logging the states %w", err)
+					}
+
+					err = orch.bulkPublisher(processContext, ready_task, workflow_id, msg.Task_type)
+					if err != nil {
+						log.Println("Error in publishing the tasks %w", err)
+						return
+					} else {
+						err = m.Ack()
+						if err != nil {
+							log.Println("Error in ack the message %w", err)
+							return
+						}
+					}
+					//time.Sleep(10 * time.Second)
+				}(m)
+
+			}
+			//wg.Wait()
 		}
-		for m := range bulk.Messages() {
-			var msg tempschema
-			err = json.Unmarshal(m.Data(), &msg)
-			if err != nil {
-				log.Println("Error in converting jetstream.Msg to tempschema %w", err)
-				continue
-			}
 
-			updateContext, updatecontextCancel := context.WithTimeout(ctx, time.Second)
-			defer updatecontextCancel()
-			workflow_id := msg.WorkFlow_id //can be further optimized by evaluating one workflow only one time
-			task_id := msg.Task_id
-			err = orch.DbDriver.UpdateTask(updateContext, task_id, workflow_id, "COMPLETED")
-			if err != nil {
-				log.Println("Error in updating task_status %w:", err)
-				continue
-			}
-
-			driverContext, driverContextCancel := context.WithTimeout(ctx, time.Second) //check how to close this gracefully
-			defer driverContextCancel()
-			ready_task, err := orch.DbDriver.Evaluate(driverContext, workflow_id)
-			if err != nil {
-				log.Println("Error in Evaluating DAG %w", err)
-				continue
-			}
-
-			publisherContext, publisherContextCancel := context.WithTimeout(ctx, time.Second)
-			defer publisherContextCancel()
-			err = orch.bulkPublisher(publisherContext, ready_task, workflow_id, msg.Task_type)
-			if err != nil {
-				log.Println("Error in publishing the tasks %w", err)
-				continue
-			}
-
-			err = m.Ack()
-			if err != nil {
-				log.Println("Error in ack the message %w", err)
-				continue
-			}
-		}
 	}
+
 }
 
 func (orch *Orchestrator) bulkPublisher(ctx context.Context, tasks []uuid.UUID, workflow_id uuid.UUID, task_type string) error {
@@ -126,7 +147,7 @@ func (orch *Orchestrator) bulkPublisher(ctx context.Context, tasks []uuid.UUID, 
 			Task_type:   task_type,
 		}
 		msgByte, err := json.Marshal(msg)
-		err = orch.StreamHandler.Publish(ctx, msgByte, "tasks.EXCUTE")
+		err = orch.StreamHandler.Publish(ctx, msgByte, "task.EXECUTE")
 		if err != nil {
 			return err
 		}
@@ -134,9 +155,75 @@ func (orch *Orchestrator) bulkPublisher(ctx context.Context, tasks []uuid.UUID, 
 	return nil
 }
 
-func (orch *Orchestrator) RootNodeUpdater(ctx context.Context, workflow_id uuid.UUID) []uuid.UUID {
+func (orch *Orchestrator) RootNodeUpdater(ctx context.Context, workflow_id uuid.UUID) error {
 	//This fucntion is to update the status of the root nodes of DAG since func StartOrchestrating() only relies on task.Completed it won't able to identify and
 	//trigger the Root ndoes so every time when we create a DAG we have to run this func
+
+	//Important point to note this can cause single point of failure since if the evaulate of publishing fails parent nodes have no way to start so a background worker
+	// is needed to clean up this kind of things
 	driverContext, driverContextCancel := context.WithTimeout(ctx, time.Second)
 	defer driverContextCancel()
+	ready_task, err := orch.DbDriver.Evaluate(driverContext, workflow_id)
+	if err != nil {
+		return fmt.Errorf("Error in Evaluating Root DAG error: %w", err)
+	}
+
+	err = orch.testTempLogger(ctx, workflow_id)
+	if err != nil {
+		log.Println("Error in logging the states %w", err)
+	}
+
+	publisherContext, publisherContextCancel := context.WithTimeout(ctx, time.Second)
+	defer publisherContextCancel()
+	err = orch.bulkPublisher(publisherContext, ready_task, workflow_id, "ParentNode") //need to change this part
+	if err != nil {
+		return fmt.Errorf("Error in publishing the tasks %w", err)
+
+	}
+
+	return nil
+
+}
+
+func (orch *Orchestrator) BackgroundSweeper(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			processContext, processcontextCancel := context.WithTimeout(context.Background(), 1*time.Second)
+			result, err := orch.DbDriver.GetAllReadyLongLivedTasks(processContext)
+			processcontextCancel()
+			if err != nil {
+				log.Println("Error in background sweeper while getting the long lived task, ERROR: %w", err)
+				continue
+			}
+			for _, r := range result {
+				msgByte, err := json.Marshal(r)
+				err = orch.StreamHandler.Publish(ctx, msgByte, "task.EXECUTE")
+				if err != nil {
+					log.Println("Error in background sweeper while publishing, ERROR: %w", err)
+				}
+			}
+
+		case <-ctx.Done():
+			return
+		}
+
+	}
+}
+
+func (orch *Orchestrator) testTempLogger(ctx context.Context, workflowID uuid.UUID) error {
+	tasksInfo, err := orch.DbDriver.TesttempGettingInfo(ctx, workflowID)
+	if err != nil {
+		log.Println("iteration: failed to get task info: %v", err)
+		return err
+	}
+
+	for _, info := range tasksInfo {
+		log.Printf("Iteration - Type: %s, Status: %s", info.Task_type, info.Task_status)
+	}
+
+	log.Printf("end of iteration")
+	return nil
 }
