@@ -32,3 +32,9 @@ type Edges_schema struct {
 	Parent_id uuid.UUID
 	Child_id  uuid.UUID
 }
+
+type Tempschema struct {
+	WorkFlow_id uuid.UUID `json:"Workflow_id"`
+	Task_id     uuid.UUID `json:"Task_id"`
+	Task_type   string    `json:"Task_type"`
+}

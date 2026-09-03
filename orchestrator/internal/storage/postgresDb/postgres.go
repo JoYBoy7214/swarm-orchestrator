@@ -2,6 +2,7 @@ package postgresDb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	Graph "github.com/JoYBoy7214/swarm-orchestrator/internal"
 	storage "github.com/JoYBoy7214/swarm-orchestrator/internal/storage"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -241,6 +243,29 @@ func (pd *PostgresDriver) GetAllReadyLongLivedTasks(ctx context.Context) ([]stor
 	return result, nil
 }
 
+func (pd PostgresDriver) GetTaskStatus(ctx context.Context, task_id uuid.UUID) (string, error) {
+	query := `
+		UPDATE tasks
+		SET status = 'RUNNING'
+		WHERE id = $1
+		  AND status = 'PENDING'
+		RETURNING id, status;
+	`
+
+	var id int
+	var status string
+	err := pd.pool.QueryRow(ctx, query, task_id).Scan(&id, &status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// This is where execution goes if status was already RUNNING (or ID not found)
+			fmt.Println("Job was not PENDING (already RUNNING or does not exist)")
+			return "RUNNING", nil
+		}
+		return "", fmt.Errorf("Error in quering the row ERROR: %w", err)
+	}
+	return status, nil
+}
+
 func (pd *PostgresDriver) TesttempGettingInfo(ctx context.Context, workflow_id uuid.UUID) ([]Temp, error) {
 	var result []Temp
 	query_string := "select task_id,task_type,status from tasks where workflow_id =$1"
@@ -251,7 +276,7 @@ func (pd *PostgresDriver) TesttempGettingInfo(ctx context.Context, workflow_id u
 	defer rows.Close()
 	for rows.Next() {
 		var temp1 Temp
-		if err := rows.Scan(&temp1.Task_id, &temp1.Task_type, &temp1.Task_status); err != nil {
+		if err = rows.Scan(&temp1.Task_id, &temp1.Task_type, &temp1.Task_status); err != nil {
 			return nil, fmt.Errorf("Error in scanning the rows %w", err)
 		}
 		result = append(result, temp1)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/JoYBoy7214/swarm-orchestrator/internal/orchestrator"
+	"github.com/JoYBoy7214/swarm-orchestrator/internal/storage"
 	"github.com/nats-io/nats.go"
 )
 
@@ -52,6 +54,49 @@ func main() {
 		w.WriteHeader(http.StatusAccepted)
 	})
 
+	mux.HandleFunc("GET /api/v1/tasks/{task_id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		var req storage.Tempschema
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			log.Println("Error in decoding request %w", err)
+			http.Error(w, "Error in decoding request", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+		defer cancel()
+		result, err := orch.DbDriver.GetTaskStatus(ctx, req.Task_id)
+		if err != nil {
+			log.Println("Error in getting task %w", err)
+			http.Error(w, "Error in getting task", http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(result)
+
+	})
+
+	mux.HandleFunc("UPDATE /api/v1/tasks/{task_id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		var req storage.Tempschema
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			log.Println("Error in decoding request %w", err)
+			http.Error(w, "Error in decoding request", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+		defer cancel()
+		err = orch.DbDriver.UpdateTask(ctx, req.Task_id, req.WorkFlow_id, "RUNNING")
+		if err != nil {
+			log.Println("Error in updating task %w", err)
+			http.Error(w, "Error in updating task", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
 	srv := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
@@ -63,6 +108,11 @@ func main() {
 			log.Fatalf("Server error: %v", err)
 		}
 	}()
+	wg.Add(1)
+	go func(ctx context.Context) {
+		defer wg.Done()
+		orch.BackgroundSweeper(ctx)
+	}(ctx)
 
 	<-ctx.Done()
 	log.Println("shutdowning grace fully")
@@ -72,6 +122,6 @@ func main() {
 		log.Printf("HTTP shutdown error: %v", err)
 	}
 	wg.Wait()
-	stop() //this will not wait it will just trigger the signal
+	stop() //this will not wait it will just trigger the signal so we have to do waiting manualy
 	log.Println("Application stopped cleanly.")
 }
