@@ -4,14 +4,14 @@ import json
 import logging
 from nats.aio.client import Client as NATS
 from nats.errors import TimeoutError
+import aiohttp
+import random
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 async def worker_task(worker_id, js, stop_event):
     try:
-        # All concurrent workers share this durable name.
-        # JetStream automatically load-balances the messages across them.
         sub = await js.pull_subscribe("task.EXECUTE", durable="concurrent_worker_group")
     except Exception as e:
         logger.error(f"Worker {worker_id} - Error creating consumer: {e}")
@@ -19,60 +19,97 @@ async def worker_task(worker_id, js, stop_event):
 
     logger.info(f"Worker {worker_id} started.")
 
-    while not stop_event.is_set():
-        try:
-            # Fetch 1 message, wait up to 1 second
-            msgs = await sub.fetch(1, timeout=0.5)
-            
-            for msg in msgs:
-                try:
-                    # 1. Parse the schema
-                    d = json.loads(msg.data)
-                    workflow_id = d.get("Workflow_id")
-                    task_id = d.get("Task_id")
-                    task_type = d.get("Task_type")
-                    
-                    logger.info(f"Worker {worker_id} processing Task: {task_id} (Type: {task_type})")
+    # Reuse one session for the worker's lifetime instead of creating one per request
+    async with aiohttp.ClientSession() as session:
+        while not stop_event.is_set():
+            try:
+                msgs = await sub.fetch(1, timeout=0.5)
 
-                    # 2. Simulate task execution
-                    await asyncio.sleep(2)
-                    
-                    # 3. Prepare completed payload
-                    completed_payload = {
-                        "Workflow_id": workflow_id,
-                        "Task_id": task_id,
-                        "Task_type": task_type,
-                    }
-                    
-                    # 4. Push to completion subject
-                    await js.publish(
-                        "task.COMPLETED", 
-                        json.dumps(completed_payload).encode("utf-8")
-                    )
-                    
-                    # 5. Acknowledge successful processing
-                    await msg.ack()
-                    logger.info(f"Worker {worker_id} completed and acked Task: {task_id}")
-                    
-                except json.JSONDecodeError:
-                    logger.error(f"Worker {worker_id} - Invalid JSON. Terminating message.")
-                    # .term() prevents the message from being requeued
-                    await msg.term()
-                    
-                except Exception as e:
-                    logger.error(f"Worker {worker_id} - Processing failed: {e}")
-                    # .nak() tells JetStream we failed and to redeliver it
-                    await msg.nak()
-                
-        except TimeoutError:
-            continue  # No messages, loop again and check stop_event
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            if not stop_event.is_set():
-                logger.error(f"Worker {worker_id} unexpected error: {e}")
-                await asyncio.sleep(1) # Prevent tight loop on severe connection issues
-                
+                for msg in msgs:
+                    try:
+                        d = json.loads(msg.data)
+                        workflow_id = d.get("Workflow_id")
+                        task_id = d.get("Task_id")
+                        task_type = d.get("Task_type")
+
+                        
+
+                        # --- HTTP idempotency check before doing the work ---
+                        payload = {
+                            "Workflow_id": workflow_id,
+                            "Task_id": task_id,
+                            "Task_type": task_type,
+                        }
+
+                        proceed = False
+                        try:
+                            async with session.request(
+                                "PATCH",
+                                f"http://localhost:8080/api/v1/tasks/{task_id}",
+                                json=payload,
+                                timeout=aiohttp.ClientTimeout(total=2),
+                            ) as resp:
+                                if resp.status == 200:
+                                    proceed = True
+                                else:
+                                    body = await resp.text()
+                                    logger.warning(
+                                        f"Worker {worker_id} - Task {task_id} not eligible "
+                                        f"(status {resp.status}): {body}"
+                                    )
+                        except asyncio.TimeoutError:
+                            logger.error(f"Worker {worker_id} - HTTP timeout checking Task {task_id}")
+                        except aiohttp.ClientError as e:
+                            logger.error(f"Worker {worker_id} - HTTP error checking Task {task_id}: {e}")
+
+                        if not proceed:
+                            # Idempotency check failed / task already running / HTTP error
+                            # -> don't process it, just ack so it's not redelivered
+                            logger.info(
+                                            f"Worker {worker_id} - Task {task_id} not eligible "
+                                            f"(status {resp.status}): {body}"
+                                            )
+                            await msg.ack()
+                            continue
+
+                        
+                        # --- Simulate task execution ---
+                        rand_int = random.randint(2, 5)
+                        logger.info(f"Worker {worker_id} processing Task: {task_id} (Type: {task_type}) (excution time: {rand_int})")
+                        await asyncio.sleep(rand_int)
+
+                        # Prepare completed payload
+                        completed_payload = {
+                            "Workflow_id": workflow_id,
+                            "Task_id": task_id,
+                            "Task_type": task_type,
+                        }
+
+                        await js.publish(
+                            "task.COMPLETED",
+                            json.dumps(completed_payload).encode("utf-8")
+                        )
+
+                        await msg.ack()
+                        logger.info(f"Worker {worker_id} completed and acked Task: {task_id}")
+
+                    except json.JSONDecodeError:
+                        logger.error(f"Worker {worker_id} - Invalid JSON. Terminating message.")
+                        await msg.term()
+
+                    except Exception as e:
+                        logger.error(f"Worker {worker_id} - Processing failed: {e}")
+                        await msg.nak()
+
+            except TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not stop_event.is_set():
+                    logger.error(f"Worker {worker_id} unexpected error: {e}")
+                    await asyncio.sleep(1)
+
     logger.info(f"Worker {worker_id} shutting down.")
 
 

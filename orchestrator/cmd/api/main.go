@@ -54,7 +54,30 @@ func main() {
 		w.WriteHeader(http.StatusAccepted)
 	})
 
-	mux.HandleFunc("GET /api/v1/tasks/{task_id}", func(w http.ResponseWriter, r *http.Request) {
+	// mux.HandleFunc("GET /api/v1/tasks/{task_id}", func(w http.ResponseWriter, r *http.Request) {
+	// 	w.Header().Set("content-type", "application/json")
+	// 	var req storage.Tempschema
+	// 	err := json.NewDecoder(r.Body).Decode(&req)
+	// 	if err != nil {
+	// 		log.Println("Error in decoding request %w", err)
+	// 		http.Error(w, "Error in decoding request", http.StatusBadRequest)
+	// 		return
+	// 	}
+
+	// 	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+	// 	defer cancel()
+	// 	result, err := orch.DbDriver.GetTaskStatus(ctx, req.Task_id)
+	// 	if err != nil {
+	// 		log.Println("Error in getting task %w", err)
+	// 		http.Error(w, "Error in getting task", http.StatusInternalServerError)
+	// 		return
+	// 	}
+
+	// 	json.NewEncoder(w).Encode(result)
+
+	// })
+
+	mux.HandleFunc("PATCH /api/v1/tasks/{task_id}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		var req storage.Tempschema
 		err := json.NewDecoder(r.Body).Decode(&req)
@@ -63,35 +86,17 @@ func main() {
 			http.Error(w, "Error in decoding request", http.StatusBadRequest)
 			return
 		}
-
 		ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
 		defer cancel()
-		result, err := orch.DbDriver.GetTaskStatus(ctx, req.Task_id)
-		if err != nil {
-			log.Println("Error in getting task %w", err)
-			http.Error(w, "Error in getting task", http.StatusInternalServerError)
-			return
-		}
-
-		json.NewEncoder(w).Encode(result)
-
-	})
-
-	mux.HandleFunc("UPDATE /api/v1/tasks/{task_id}", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("content-type", "application/json")
-		var req storage.Tempschema
-		err := json.NewDecoder(r.Body).Decode(&req)
-		if err != nil {
-			log.Println("Error in decoding request %w", err)
-			http.Error(w, "Error in decoding request", http.StatusBadRequest)
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
-		defer cancel()
-		err = orch.DbDriver.UpdateTask(ctx, req.Task_id, req.WorkFlow_id, "RUNNING")
+		flag, err := orch.DbDriver.StatusCheckForIdempotency(ctx, req.Task_id)
 		if err != nil {
 			log.Println("Error in updating task %w", err)
 			http.Error(w, "Error in updating task", http.StatusInternalServerError)
+			return
+		}
+		if !flag {
+			log.Println("Error Task is already RUNNING ")
+			http.Error(w, "Error task is already running", http.StatusConflict)
 			return
 		}
 		w.WriteHeader(http.StatusOK)

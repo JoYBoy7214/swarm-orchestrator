@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -133,7 +134,7 @@ func (pd *PostgresDriver) CreateWorkflow(ctx context.Context) (uuid.UUID, error)
 	return workflow_id, nil
 }
 func (pd *PostgresDriver) Evaluate(ctx context.Context, workflow_id uuid.UUID) ([]uuid.UUID, error) {
-	cur_time := time.Now().UTC() //could cause in consistency
+	cur_time := time.Now().UTC() //could cause inconsistency
 	tx, err := pd.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("Error in creating Transaction connection %w", err)
@@ -202,12 +203,13 @@ func (pd *PostgresDriver) Evaluate(ctx context.Context, workflow_id uuid.UUID) (
 // }
 
 func (pd *PostgresDriver) UpdateTask(ctx context.Context, task_id uuid.UUID, workflow_id uuid.UUID, status string) error {
+	cur_time := time.Now().UTC()
 	query_string := `
 	update tasks
-	set status =$1
+	set status =$1,updated_at =$4
 	where workflow_id=$2 AND task_id=$3
 	`
-	_, err := pd.pool.Exec(ctx, query_string, status, workflow_id, task_id)
+	_, err := pd.pool.Exec(ctx, query_string, status, workflow_id, task_id, cur_time)
 	if err != nil {
 		return fmt.Errorf("Error in updating the task status %w", err)
 	}
@@ -243,27 +245,28 @@ func (pd *PostgresDriver) GetAllReadyLongLivedTasks(ctx context.Context) ([]stor
 	return result, nil
 }
 
-func (pd PostgresDriver) GetTaskStatus(ctx context.Context, task_id uuid.UUID) (string, error) {
+func (pd PostgresDriver) StatusCheckForIdempotency(ctx context.Context, taskID uuid.UUID) (bool, error) {
+	curTime := time.Now().UTC()
 	query := `
-		UPDATE tasks
-		SET status = 'RUNNING'
-		WHERE id = $1
-		  AND status = 'PENDING'
-		RETURNING id, status;
-	`
+        UPDATE tasks
+        SET status = 'RUNNING', updated_at = $2
+        WHERE task_id = $1
+          AND status = 'READY'
+        RETURNING status;
+    `
 
-	var id int
 	var status string
-	err := pd.pool.QueryRow(ctx, query, task_id).Scan(&id, &status)
+	err := pd.pool.QueryRow(ctx, query, taskID, curTime).Scan(&status)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// This is where execution goes if status was already RUNNING (or ID not found)
-			fmt.Println("Job was not PENDING (already RUNNING or does not exist)")
-			return "RUNNING", nil
+			// Task does not exist or was already picked up
+			log.Println("Error from postgress: %w", err)
+			return false, nil
 		}
-		return "", fmt.Errorf("Error in quering the row ERROR: %w", err)
+		return false, fmt.Errorf("failed to claim task: %w", err)
 	}
-	return status, nil
+
+	return true, nil // Successfully claimed
 }
 
 func (pd *PostgresDriver) TesttempGettingInfo(ctx context.Context, workflow_id uuid.UUID) ([]Temp, error) {
