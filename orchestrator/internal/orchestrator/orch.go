@@ -191,9 +191,11 @@ func (orch *Orchestrator) BackgroundSweeper(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
+			log.Println("Background Sweeper Running")
 			processContext, processcontextCancel := context.WithTimeout(context.Background(), 1*time.Second)
 			result, err := orch.DbDriver.GetAllReadyLongLivedTasks(processContext)
 			processcontextCancel()
+			log.Printf("Background Sweeper Running %i", len(result))
 			if err != nil {
 				log.Println("Error in background sweeper while getting the long lived task, ERROR: %w", err)
 				continue

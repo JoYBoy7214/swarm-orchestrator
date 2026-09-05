@@ -224,16 +224,16 @@ type Temp struct {
 
 func (pd *PostgresDriver) GetAllReadyLongLivedTasks(ctx context.Context) ([]storage.Tempschema, error) {
 	var result []storage.Tempschema
-
-	query_string := `select workflow_id,Task_id,Task_type from tasks where status='READY' and (updated_at - created_at) > INTERVAL '1 minute' `
-	rows, err := pd.pool.Query(ctx, query_string)
+	cur_time := time.Now().UTC()
+	query_string := `select workflow_id,Task_id,Task_type from tasks where status in ('READY','RUNNING') and ($1 - updated_at) > INTERVAL '1 minute' `
+	rows, err := pd.pool.Query(ctx, query_string, cur_time)
 	if err != nil {
-		return nil, fmt.Errorf("Error in getting the lofn lived ready rows  %w", err)
+		return nil, fmt.Errorf("Error in getting the long lived ready rows  %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var temp storage.Tempschema
-		if err = rows.Scan(&temp); err != nil {
+		if err = rows.Scan(&temp.WorkFlow_id, &temp.Task_id, &temp.Task_type); err != nil {
 			return nil, fmt.Errorf("Error in iterating the rows %w", err)
 		}
 		result = append(result, temp)

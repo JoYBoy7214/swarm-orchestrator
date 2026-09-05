@@ -66,15 +66,13 @@ async def worker_task(worker_id, js, stop_event):
                         if not proceed:
                             # Idempotency check failed / task already running / HTTP error
                             # -> don't process it, just ack so it's not redelivered
-                            logger.info(
-                                            f"Worker {worker_id} - Task {task_id} not eligible "
-                                            f"(status {resp.status}): {body}"
-                                            )
                             await msg.ack()
                             continue
 
                         
                         # --- Simulate task execution ---
+                        if worker_id==1:
+                            return
                         rand_int = random.randint(2, 5)
                         logger.info(f"Worker {worker_id} processing Task: {task_id} (Type: {task_type}) (excution time: {rand_int})")
                         await asyncio.sleep(rand_int)

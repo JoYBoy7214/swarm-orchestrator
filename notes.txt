@@ -2,3 +2,7 @@
 
 Right now each worker will update the task status to "RUNNING" and start the work but if the worker died during middle of the work nats will redeliver the 
 message in queue but since the status is changed to "RUNNING" next work will simply act the message but work will never be done
+
+solution: for now we can let the background sweeper to take care of the pushing the task again in the stream once again it will check for the task which are 
+int READY or RUNNING State for more than 1 min and push it into the stream and we have to make sure it will update the RUNNING state to READY state so worker 
+won't skip it in idempotency check
