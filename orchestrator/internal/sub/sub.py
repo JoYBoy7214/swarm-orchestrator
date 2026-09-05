@@ -5,6 +5,7 @@ import logging
 from nats.aio.client import Client as NATS
 from nats.errors import TimeoutError
 import aiohttp
+from nats.js.api import ConsumerConfig, AckPolicy
 import random
 
 logging.basicConfig(level=logging.INFO)
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 async def worker_task(worker_id, js, stop_event):
     try:
-        sub = await js.pull_subscribe("task.EXECUTE", durable="concurrent_worker_group")
+        sub = await js.pull_subscribe("task.EXECUTE", durable="concurrent_worker_group",stream="TASKS")
     except Exception as e:
         logger.error(f"Worker {worker_id} - Error creating consumer: {e}")
         return
@@ -122,6 +123,16 @@ async def main():
         return
 
     js = nc.jetstream()
+    await js.add_consumer(
+    "TASKS", # The stream that holds "task.EXECUTE"
+    config=ConsumerConfig(
+        durable_name="concurrent_worker_group",
+        ack_policy=AckPolicy.EXPLICIT,
+        max_deliver=5,                     # Limit retries
+        ack_wait=10.0,                     # Give workers 10s to ack
+        filter_subject="task.EXECUTE"      # Only consume these subjects
+    )
+)
     stop_event = asyncio.Event()
 
     def signal_handler():

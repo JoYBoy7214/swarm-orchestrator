@@ -1,0 +1,4 @@
+06/09/2026
+
+Right now each worker will update the task status to "RUNNING" and start the work but if the worker died during middle of the work nats will redeliver the 
+message in queue but since the status is changed to "RUNNING" next work will simply act the message but work will never be done
