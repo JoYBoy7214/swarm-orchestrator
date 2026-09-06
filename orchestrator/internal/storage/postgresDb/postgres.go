@@ -225,12 +225,30 @@ type Temp struct {
 func (pd *PostgresDriver) GetAllReadyLongLivedTasks(ctx context.Context) ([]storage.Tempschema, error) {
 	var result []storage.Tempschema
 	cur_time := time.Now().UTC()
-	query_string := `select workflow_id,Task_id,Task_type from tasks where status in ('READY','RUNNING') and ($1 - updated_at) > INTERVAL '1 minute' `
+
+	//this query will first update the long running tasks(which are in RUNNING state for more than one minute) to READY and return the those task (with updated_running_tasks)
+	//the second block of query will union the previous result with ready task which are in same state for more than one minute
+	//postgres will use the snapshot of the data when the query started so there will be no duplications in the second block
+
+	query_string := `WITH updated_running_tasks AS (
+    UPDATE tasks
+    SET status = 'READY'
+    WHERE status = 'RUNNING' 
+      AND ($1 - updated_at) > INTERVAL '1 minute'
+    RETURNING workflow_id, Task_id, Task_type
+	)
+	SELECT * FROM updated_running_tasks
+	UNION ALL
+	SELECT workflow_id, Task_id, Task_type 
+	FROM tasks 
+	WHERE status = 'READY' 
+    AND ($1 - updated_at) > INTERVAL '1 minute'; `
 	rows, err := pd.pool.Query(ctx, query_string, cur_time)
 	if err != nil {
 		return nil, fmt.Errorf("Error in getting the long lived ready rows  %w", err)
 	}
 	defer rows.Close()
+
 	for rows.Next() {
 		var temp storage.Tempschema
 		if err = rows.Scan(&temp.WorkFlow_id, &temp.Task_id, &temp.Task_type); err != nil {
